@@ -877,13 +877,12 @@ See the ASCII bar chart in the Architecture section above for a visual represent
 - **Memory**: Per-model RDS files are ~1-2 MB each; combined results ~10-15 MB
 
 ## References
-
+- Rosseel, Y. (2012). lavaan: An R package for structural equation modeling. *Journal of Statistical Software*, 48(2), 1-36.
 - Bradley, J. V. (1978). Robustness? *British Journal of Mathematical and Statistical Psychology*, 31(2), 144-152.
 - Swain, A. J. (1975). A class of estimators for the mean of a multivariate normal distribution. *Unpublished doctoral dissertation*, University of Adelaide.
 - Yuan, K.-H. (2015). Improved differential equation modeling of the mean and covariance structure. *Multivariate Behavioral Research*, 50(2), 164-184.
 - Satorra, A., & Bentler, P. M. (1994). Corrections to test statistics and standard errors in covariance structure analysis. *Psychological Methods*, 1(4), 390-417.
 - Bollen, K. A., & Stine, R. A. (1992). Bootstrapping goodness-of-fit measures in structural equation models. *Sociological Methodology*, 22, 111-135.
-- Rosseel, Y. (2012). lavaan: An R package for structural equation modeling. *Journal of Statistical Software*, 48(2), 1-36.
 
 ## License
 
