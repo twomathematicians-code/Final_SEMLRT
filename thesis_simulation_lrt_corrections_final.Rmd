@@ -1,0 +1,1117 @@
+---
+title: "Master Thesis Simulation: Small-Sample Corrections for LRT in SEM"
+subtitle: "Comparing Correction Methods Across Model Complexities"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      cache = TRUE)
+
+# install.packages(c("lavaan", "semTools", "dplyr", "tidyr", "knitr", "progress", "ggplot2"))
+
+library(lavaan)
+library(semTools)
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(progress)
+library(ggplot2)
+
+# --- THESIS SIMULATION SETTINGS ---
+sample_sizes <- c(50, 100, 150, 200, 250, 300, 500, 1000,10000)
+n_reps       <- 1000
+alpha        <- 0.05
+set.seed(2024)
+
+# --- HELPER FUNCTIONS (used across all chunks) ---
+
+# Safely fit a lavaan model; returns NULL on failure
+safe_fit <- function(syntax, data, estimator = "ML", test = NULL, bootstrap = NULL) {
+  args <- list(model = syntax, data = data, estimator = estimator, warn = FALSE)
+  if (!is.null(test))      args$test <- test
+  if (!is.null(bootstrap)) args$bootstrap <- bootstrap
+  tryCatch(do.call(sem, args), error = function(e) NULL)
+}
+
+# Safely extract a fit measure, stripping lavaan.vector S3 class
+safe_fm <- function(fit, measure) {
+  if (is.null(fit)) return(NA_real_)
+  tryCatch(as.numeric(unclass(fitMeasures(fit, measure))), error = function(e) NA_real_)
+}
+
+# Safely call chisqSmallN(); returns list(chisq, pvalue) with NA fallbacks
+safe_smallN <- function(fit, method) {
+  if (is.null(fit)) return(list(chisq = NA_real_, pvalue = NA_real_))
+  res <- tryCatch(chisqSmallN(fit, smallN.method = method), error = function(e) NULL)
+  if (is.null(res) || length(res) == 0) return(list(chisq = NA_real_, pvalue = NA_real_))
+  c_val <- res[["chisq"]]; p_val <- res[["pvalue"]]
+  list(
+    chisq   = if (length(c_val) == 1) as.numeric(c_val) else NA_real_,
+    pvalue  = if (length(p_val) == 1) as.numeric(p_val) else NA_real_
+  )
+}
+
+# Safe rejection decision (handles NULL, length-0, NA)
+safe_reject <- function(p, alpha = 0.05) {
+  if (length(p) != 1) return(NA)
+  if (is.na(p)) return(NA)
+  p < alpha
+}
+```
+
+# 1. Model Definitions
+
+We simulate data under the Null Hypothesis (H0) at **three levels of model complexity**:
+
+1.  **Simple CFA** (df = 24): 3 latent factors, 9 observed indicators, one factor correlation.
+2.  **Complex CFA** (df ~ 120): 6 latent factors, 18 observed indicators, eight factor correlations.
+3.  **Full SEM** (df ~ 21): 3 latent factors, 9 indicators, structural regression paths, one factor correlation.
+
+For each model, the fitted model is exactly the model that generated the data. This allows us to calculate **Type I Error rates** (rejection rates) under correctly specified models.
+
+```{r model-definitions}
+# ---- Model 1: Simple CFA (3 factors, 9 indicators) ----
+simple_cfa_syntax <- '
+  f1 =~ x1 + x2 + x3
+  f2 =~ x4 + x5 + x6
+  f3 =~ x7 + x8 + x9
+  f1 ~~ f2
+'
+
+# ---- Model 2: Complex CFA (6 factors, 18 indicators) ----
+complex_cfa_syntax <- '
+  f1 =~ y01 + y02 + y03
+  f2 =~ y04 + y05 + y06
+  f3 =~ y07 + y08 + y09
+  f4 =~ y10 + y11 + y12
+  f5 =~ y13 + y14 + y15
+  f6 =~ y16 + y17 + y18
+  f1 ~~ f2
+  f1 ~~ f3
+  f1 ~~ f4
+  f2 ~~ f3
+  f3 ~~ f4
+  f4 ~~ f5
+  f4 ~~ f6
+  f5 ~~ f6
+'
+
+# ---- Model 3: Full SEM (3 factors, 9 indicators, structural paths) ----
+full_sem_syntax <- '
+  f1 =~ x1 + x2 + x3
+  f2 =~ x4 + x5 + x6
+  f3 =~ x7 + x8 + x9
+  f3 ~ f1 + f2
+  f1 ~~ f2
+'
+
+# ---- Build model registry ----
+models <- list(
+  simple_cfa  = list(name = "Simple CFA",
+                     description = "3 factors, 9 indicators",
+                     syntax = simple_cfa_syntax),
+  complex_cfa = list(name = "Complex CFA",
+                     description = "6 factors, 18 indicators",
+                     syntax = complex_cfa_syntax),
+  full_sem    = list(name = "Full SEM",
+                     description = "3 factors, 9 indicators + structural paths",
+                     syntax = full_sem_syntax)
+)
+
+# Compute df for each model via a dummy fit
+model_info <- list()
+for (key in names(models)) {
+  m <- models[[key]]
+  dummy_data <- simulateData(m$syntax, sample.nobs = 2000)
+  dummy_fit  <- sem(m$syntax, data = dummy_data, warn = FALSE)
+  model_info[[key]] <- list(
+    name        = m$name,
+    description = m$description,
+    syntax      = m$syntax,
+    df          = as.integer(safe_fm(dummy_fit, "df")),
+    n_indicators = ncol(dummy_data)
+  )
+}
+```
+
+```{r show-model-info, echo=FALSE}
+model_summary_df <- data.frame(
+  Model = sapply(model_info, function(x) x$name),
+  Description = sapply(model_info, function(x) x$description),
+  Indicators = sapply(model_info, function(x) x$n_indicators),
+  df = sapply(model_info, function(x) x$df)
+)
+kable(model_summary_df,
+      caption = "Three model complexity levels used in the simulation.",
+      col.names = c("Model", "Description", "Indicators (p)", "Degrees of Freedom"))
+```
+
+# 2. Run Simulation
+
+The simulation is split into **separate cached chunks**, one per correction method. Each chunk loops over all 3 model complexity levels. Results are saved in **per-model RDS files** (e.g., `thesis_sim_base_simple_cfa.rds`) for fault isolation.
+
+Each chunk uses the **same per-iteration seed** (based on a global index) to guarantee identical data generation across all method chunks for a given model/N/replication combination.
+
+Seed strategy:
+$$\text{seed} = 20240000 + (\text{model\_offset}) + (\text{iter\_index})$$
+where `model_offset = (\text{model\_rank} - 1) \times |\text{sample\_sizes}| \times \text{n\_reps}`.
+
+## 2.1 Base: Data Generation & Uncorrected LRT
+
+```{r sim-base, results='asis'}
+# Verbose output: show detailed per-iteration steps for Simple CFA only
+# (Complex CFA and Full SEM suppress per-iteration output to avoid massive output)
+verbose_models <- c("simple_cfa")
+
+total_per_model <- length(sample_sizes) * n_reps
+
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+  model_rank <- which(names(models) == model_key)
+  model_offset <- (model_rank - 1) * total_per_model
+
+  cat(sprintf("\n\n%s%s%s\n",
+      paste(rep("=", 60), collapse = ""),
+      paste(rep("=", 60), collapse = ""),
+      paste(rep("=", 60), collapse = "")))
+  cat(sprintf("  MODEL: %s  (%s)  |  df = %d\n", info$name, info$description, info$df))
+  cat(sprintf("  %d sample sizes x %d replications = %d iterations\n",
+              length(sample_sizes), n_reps, total_per_model))
+  cat(sprintf("%s\n\n", paste(rep("=", 60), collapse = "")))
+
+  verbose_flag <- model_key %in% verbose_models
+
+  results <- list()
+  pb <- progress_bar$new(
+    format = paste0("  [", substr(model_key, 1, 6), "]  ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = total_per_model, clear = FALSE, width = 80
+  )
+
+  idx <- 0
+  prev_n <- NA
+
+  for (n in sample_sizes) {
+
+    if (verbose_flag && (is.na(prev_n) || n != prev_n)) {
+      cat(sprintf("\n========================================\n"))
+      cat(sprintf("  N = %d  |  %d replications  (%d of %d sample sizes)\n",
+                  n, n_reps, which(sample_sizes == n), length(sample_sizes)))
+      cat(sprintf("========================================\n"))
+    }
+    prev_n <- n
+
+    for (i in 1:n_reps) {
+      idx <- idx + 1
+      global_seed <- 20240000 + model_offset + idx
+      pb$tick(tokens = list(cur = idx, tot = total_per_model,
+                            n = n, rep = i, reps = n_reps))
+
+      # STEP 1: Set seed
+      set.seed(global_seed)
+      if (verbose_flag) {
+        cat(sprintf("\n  --- Iter %d/%d  |  N=%d  |  Rep %d/%d  |  seed=%d ---\n",
+                    idx, total_per_model, n, i, n_reps, global_seed))
+      }
+
+      # STEP 2: Generate data under H0
+      sim_data <- tryCatch(
+        simulateData(syn, sample.nobs = n),
+        error = function(e) NULL
+      )
+
+      if (verbose_flag) {
+        if (!is.null(sim_data)) {
+          cat(sprintf("    Step 2/4 : Generated %d x %d dataset\n", n, ncol(sim_data)))
+        } else {
+          cat("    Step 2/4 : Data generation FAILED\n")
+        }
+      }
+
+      # STEP 3: Fit ML model
+      fit_ml <- NULL
+      if (!is.null(sim_data)) {
+        fit_ml <- tryCatch(
+          sem(syn, data = sim_data, estimator = "ML", warn = FALSE),
+          error = function(e) NULL
+        )
+      }
+
+      if (verbose_flag) {
+        if (!is.null(fit_ml)) {
+          cat("    Step 3/4 : ML estimation ........... OK\n")
+        } else {
+          cat("    Step 3/4 : ML estimation ........... FAILED\n")
+        }
+      }
+
+      # STEP 4: Extract chi-square and p-value
+      unc_chisq <- safe_fm(fit_ml, "chisq")
+      unc_p     <- safe_fm(fit_ml, "pvalue")
+
+      if (verbose_flag) {
+        reject_flag <- if (!is.na(unc_p) && unc_p < alpha) " *REJECT*" else ""
+        cat(sprintf("    Step 4/4 : chi-sq = %8.2f, p = %.4f%s\n",
+                    ifelse(is.na(unc_chisq), NA, unc_chisq),
+                    ifelse(is.na(unc_p), NA, unc_p),
+                    reject_flag))
+      }
+
+      results[[idx]] <- data.frame(
+        Model = model_key,
+        N = n, Rep = i, iter_seed = global_seed,
+        unc_chisq = unc_chisq, unc_p = unc_p,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    # Per-N summary
+    if (verbose_flag) {
+      partial <- bind_rows(results)
+      partial_n <- partial[partial$N == n, ]
+      rr_n <- mean(!is.na(partial_n$unc_p) & partial_n$unc_p < alpha, na.rm = TRUE) * 100
+      cat(sprintf("\n  >> N=%d complete: %d reps | Rejection rate = %.2f%%\n", n, n_reps, rr_n))
+    }
+  }
+
+  base_df_model <- bind_rows(results)
+  saveRDS(base_df_model, paste0("thesis_sim_base_", model_key, ".rds"))
+  cat(sprintf("\n  [%s] Base chunk complete: %d rows saved.\n",
+              info$name, nrow(base_df_model)))
+}
+```
+
+## 2.2 Swain Correction
+
+```{r sim-swain, results='hide'}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+
+  base_df <- readRDS(paste0("thesis_sim_base_", model_key, ".rds"))
+  results <- list()
+
+  pb <- progress_bar$new(
+    format = paste0("  [swain-", substr(model_key, 1, 4), "] ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = nrow(base_df), clear = FALSE, width = 80
+  )
+
+  for (row_idx in seq_len(nrow(base_df))) {
+    row <- base_df[row_idx, ]
+    pb$tick(tokens = list(cur = row_idx, tot = nrow(base_df),
+                          n = row$N, rep = row$Rep, reps = n_reps))
+
+    set.seed(row$iter_seed)
+    sim_data <- tryCatch(simulateData(syn, sample.nobs = row$N), error = function(e) NULL)
+    fit_ml   <- safe_fit(syn, sim_data, estimator = "ML")
+    res      <- safe_smallN(fit_ml, "swain")
+
+    results[[row_idx]] <- data.frame(
+      N = row$N, Rep = row$Rep,
+      T_Swain = res$chisq, P_Swain = res$pvalue,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  df_out <- bind_rows(results)
+  saveRDS(df_out, paste0("thesis_sim_swain_", model_key, ".rds"))
+  cat(sprintf("  [%s] Swain chunk complete: %d rows.\n", info$name, nrow(df_out)))
+}
+```
+
+## 2.3 Bartlett Correction
+
+```{r sim-bartlett, results='hide'}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+
+  base_df <- readRDS(paste0("thesis_sim_base_", model_key, ".rds"))
+  results <- list()
+
+  pb <- progress_bar$new(
+    format = paste0("  [bart-", substr(model_key, 1, 4), "] ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = nrow(base_df), clear = FALSE, width = 80
+  )
+
+  for (row_idx in seq_len(nrow(base_df))) {
+    row <- base_df[row_idx, ]
+    pb$tick(tokens = list(cur = row_idx, tot = nrow(base_df),
+                          n = row$N, rep = row$Rep, reps = n_reps))
+
+    set.seed(row$iter_seed)
+    sim_data <- tryCatch(simulateData(syn, sample.nobs = row$N), error = function(e) NULL)
+    fit_ml   <- safe_fit(syn, sim_data, estimator = "ML")
+    res      <- safe_smallN(fit_ml, "bartlett")
+
+    results[[row_idx]] <- data.frame(
+      N = row$N, Rep = row$Rep,
+      T_Bart = res$chisq, P_Bart = res$pvalue,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  df_out <- bind_rows(results)
+  saveRDS(df_out, paste0("thesis_sim_bart_", model_key, ".rds"))
+  cat(sprintf("  [%s] Bartlett chunk complete: %d rows.\n", info$name, nrow(df_out)))
+}
+```
+
+## 2.4 Yuan (2015) Correction
+
+```{r sim-yuan, results='hide'}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+
+  base_df <- readRDS(paste0("thesis_sim_base_", model_key, ".rds"))
+  results <- list()
+
+  pb <- progress_bar$new(
+    format = paste0("  [yuan-", substr(model_key, 1, 4), "] ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = nrow(base_df), clear = FALSE, width = 80
+  )
+
+  for (row_idx in seq_len(nrow(base_df))) {
+    row <- base_df[row_idx, ]
+    pb$tick(tokens = list(cur = row_idx, tot = nrow(base_df),
+                          n = row$N, rep = row$Rep, reps = n_reps))
+
+    set.seed(row$iter_seed)
+    sim_data <- tryCatch(simulateData(syn, sample.nobs = row$N), error = function(e) NULL)
+    fit_ml   <- safe_fit(syn, sim_data, estimator = "ML")
+    res      <- safe_smallN(fit_ml, "yuan.2015")
+
+    results[[row_idx]] <- data.frame(
+      N = row$N, Rep = row$Rep,
+      T_Yuan = res$chisq, P_Yuan = res$pvalue,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  df_out <- bind_rows(results)
+  saveRDS(df_out, paste0("thesis_sim_yuan_", model_key, ".rds"))
+  cat(sprintf("  [%s] Yuan chunk complete: %d rows.\n", info$name, nrow(df_out)))
+}
+```
+
+## 2.5 Satorra-Bentler (MLM Estimator)
+
+```{r sim-sb, results='hide'}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+
+  base_df <- readRDS(paste0("thesis_sim_base_", model_key, ".rds"))
+  results <- list()
+
+  pb <- progress_bar$new(
+    format = paste0("  [SB-", substr(model_key, 1, 4), "]   ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = nrow(base_df), clear = FALSE, width = 80
+  )
+
+  for (row_idx in seq_len(nrow(base_df))) {
+    row <- base_df[row_idx, ]
+    pb$tick(tokens = list(cur = row_idx, tot = nrow(base_df),
+                          n = row$N, rep = row$Rep, reps = n_reps))
+
+    set.seed(row$iter_seed)
+    sim_data <- tryCatch(simulateData(syn, sample.nobs = row$N), error = function(e) NULL)
+    fit_mlm  <- safe_fit(syn, sim_data, estimator = "MLM")
+
+    sb_chisq <- safe_fm(fit_mlm, "chisq.scaled")
+    sb_pval  <- safe_fm(fit_mlm, "pvalue.scaled")
+
+    results[[row_idx]] <- data.frame(
+      N = row$N, Rep = row$Rep,
+      T_SB = sb_chisq, P_SB = sb_pval,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  df_out <- bind_rows(results)
+  saveRDS(df_out, paste0("thesis_sim_sb_", model_key, ".rds"))
+  cat(sprintf("  [%s] Satorra-Bentler chunk complete: %d rows.\n", info$name, nrow(df_out)))
+}
+```
+
+## 2.6 Yuan-Bentler (MLR Estimator)
+
+```{r sim-yb, results='hide'}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+
+  base_df <- readRDS(paste0("thesis_sim_base_", model_key, ".rds"))
+  results <- list()
+
+  pb <- progress_bar$new(
+    format = paste0("  [YB-", substr(model_key, 1, 4), "]   ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = nrow(base_df), clear = FALSE, width = 80
+  )
+
+  for (row_idx in seq_len(nrow(base_df))) {
+    row <- base_df[row_idx, ]
+    pb$tick(tokens = list(cur = row_idx, tot = nrow(base_df),
+                          n = row$N, rep = row$Rep, reps = n_reps))
+
+    set.seed(row$iter_seed)
+    sim_data <- tryCatch(simulateData(syn, sample.nobs = row$N), error = function(e) NULL)
+    fit_mlr  <- safe_fit(syn, sim_data, estimator = "MLR")
+
+    yb_chisq <- safe_fm(fit_mlr, "chisq.scaled")
+    yb_pval  <- safe_fm(fit_mlr, "pvalue.scaled")
+
+    results[[row_idx]] <- data.frame(
+      N = row$N, Rep = row$Rep,
+      T_YB = yb_chisq, P_YB = yb_pval,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  df_out <- bind_rows(results)
+  saveRDS(df_out, paste0("thesis_sim_yb_", model_key, ".rds"))
+  cat(sprintf("  [%s] Yuan-Bentler chunk complete: %d rows.\n", info$name, nrow(df_out)))
+}
+```
+
+## 2.7 Bollen-Stine Bootstrap (Small N Only)
+
+```{r sim-bs, results='hide'}
+# Bollen-Stine is computationally expensive; run only for N <= 300
+bs_n_limit  <- 300
+bs_draws    <- 200
+
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  syn  <- info$syntax
+
+  base_df   <- readRDS(paste0("thesis_sim_base_", model_key, ".rds"))
+  bs_subset <- base_df[base_df$N <= bs_n_limit, ]
+
+  results <- list()
+
+  pb <- progress_bar$new(
+    format = paste0("  [BS-", substr(model_key, 1, 4), "]   ",
+                    "[:bar] :percent | ETA: :eta",
+                    " | Iter :cur/:tot | N=:n | Rep :rep/:reps"),
+    total = nrow(bs_subset), clear = FALSE, width = 80
+  )
+
+  for (row_idx in seq_len(nrow(bs_subset))) {
+    row <- bs_subset[row_idx, ]
+    pb$tick(tokens = list(cur = row_idx, tot = nrow(bs_subset),
+                          n = row$N, rep = row$Rep, reps = n_reps))
+
+    set.seed(row$iter_seed)
+    sim_data <- tryCatch(simulateData(syn, sample.nobs = row$N), error = function(e) NULL)
+
+    bs_pval <- NA_real_
+    if (!is.null(sim_data)) {
+      tryCatch({
+        fit_bs <- sem(syn, data = sim_data, test = "bollen.stine",
+                      bootstrap = bs_draws, warn = FALSE)
+        p <- safe_fm(fit_bs, "pvalue")
+        if (length(p) == 1 && !is.na(p)) bs_pval <- p
+      }, error = function(e) { bs_pval <<- NA_real_ })
+    }
+
+    results[[row_idx]] <- data.frame(
+      N = row$N, Rep = row$Rep,
+      P_BS = bs_pval,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  df_out <- bind_rows(results)
+  saveRDS(df_out, paste0("thesis_sim_bs_", model_key, ".rds"))
+  cat(sprintf("  [%s] Bollen-Stine chunk complete: %d rows.\n", info$name, nrow(df_out)))
+}
+```
+
+## 2.8 Combine All Results
+
+```{r sim-combine}
+all_results <- list()
+
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+
+  base_df  <- readRDS(paste0("thesis_sim_base_",  model_key, ".rds"))
+  swain_df <- readRDS(paste0("thesis_sim_swain_", model_key, ".rds"))
+  bart_df  <- readRDS(paste0("thesis_sim_bart_",  model_key, ".rds"))
+  yuan_df  <- readRDS(paste0("thesis_sim_yuan_",  model_key, ".rds"))
+  sb_df    <- readRDS(paste0("thesis_sim_sb_",    model_key, ".rds"))
+  yb_df    <- readRDS(paste0("thesis_sim_yb_",    model_key, ".rds"))
+  bs_df    <- readRDS(paste0("thesis_sim_bs_",    model_key, ".rds"))
+
+  # Merge all method results on (N, Rep)
+  merged <- base_df %>%
+    select(Model, N, Rep, unc_chisq, unc_p) %>%
+    left_join(swain_df %>% select(N, Rep, T_Swain, P_Swain), by = c("N", "Rep")) %>%
+    left_join(bart_df  %>% select(N, Rep, T_Bart, P_Bart),   by = c("N", "Rep")) %>%
+    left_join(yuan_df  %>% select(N, Rep, T_Yuan, P_Yuan),   by = c("N", "Rep")) %>%
+    left_join(sb_df    %>% select(N, Rep, T_SB, P_SB),       by = c("N", "Rep")) %>%
+    left_join(yb_df    %>% select(N, Rep, T_YB, P_YB),       by = c("N", "Rep")) %>%
+    left_join(bs_df    %>% select(N, Rep, P_BS),             by = c("N", "Rep")) %>%
+    mutate(
+      Model_Name = info$name,
+      Model_Desc = info$description,
+      Model_DF   = info$df,
+      Reject_Unc   = safe_reject(unc_p),
+      Reject_Swain = safe_reject(P_Swain),
+      Reject_Bart  = safe_reject(P_Bart),
+      Reject_Yuan  = safe_reject(P_Yuan),
+      Reject_SB    = safe_reject(P_SB),
+      Reject_YB    = safe_reject(P_YB),
+      Reject_BS    = safe_reject(P_BS)
+    )
+
+  all_results[[model_key]] <- merged
+  cat(sprintf("  [%s] Combined: %d rows.\n", info$name, nrow(merged)))
+}
+
+full_results <- bind_rows(all_results)
+saveRDS(full_results, "thesis_simulation_raw_results.rds")
+cat(sprintf("\nTotal combined results: %d rows, %d columns.\n",
+            nrow(full_results), ncol(full_results)))
+```
+
+# 3. Analysis: Rejection Rates (Type I Error)
+
+We calculate the proportion of replications where $p < 0.05$ for each combination of **Model Complexity**, **Sample Size**, and **Correction Method**. Since the data-generating model matches the fitted model, the expected rejection rate is $\alpha = 0.05$ (5%).
+
+## 3.1 Full Summary Table
+
+```{r analysis-summary}
+summary_table <- full_results %>%
+  group_by(Model_Name, N) %>%
+  summarise(
+    Model_DF   = first(Model_DF),
+    RR_Unc    = mean(Reject_Unc,   na.rm = TRUE) * 100,
+    RR_Swain  = mean(Reject_Swain, na.rm = TRUE) * 100,
+    RR_Bart   = mean(Reject_Bart,  na.rm = TRUE) * 100,
+    RR_Yuan   = mean(Reject_Yuan,  na.rm = TRUE) * 100,
+    RR_SB     = mean(Reject_SB,    na.rm = TRUE) * 100,
+    RR_YB     = mean(Reject_YB,    na.rm = TRUE) * 100,
+    RR_BS     = mean(Reject_BS,    na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# Display tables per model
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  tbl <- summary_table %>%
+    filter(Model_Name == info$name) %>%
+    select(-Model_Name)
+
+  cat(sprintf("\n### %s (df = %d)\n\n", info$name, info$df))
+  print(kable(tbl,
+        digits = 2,
+        caption = paste0("Type I Error Rates (Rejection %) for ", info$name,
+                         ". Ideal rate = 5%."),
+        col.names = c("N", "df", "Uncorrected", "Swain", "Bartlett",
+                      "Yuan-2015", "Satorra-Bentler", "Yuan-Bentler", "Bollen-Stine")))
+}
+```
+
+## 3.2 Convergence Rates at N >= 1000 (Sanity Check)
+
+For large sample sizes, all methods should converge to approximately 5%. This serves as a validation check.
+
+```{r analysis-convergence-check}
+convergence_check <- summary_table %>%
+  filter(N >= 1000) %>%
+  group_by(Model_Name) %>%
+  summarise(
+    across(starts_with("RR_"),
+           ~ sprintf("%.2f%%", mean(., na.rm = TRUE))),
+    .groups = "drop"
+  )
+
+kable(convergence_check,
+      caption = "Mean rejection rates at N >= 1000. All methods should be near 5%.")
+```
+
+# 4. Visualization of Results
+
+## 4.1 Main Plot: Rejection Rates by Model Complexity and Sample Size
+
+```{r plot-results, fig.width=14, fig.height=10}
+plot_data <- summary_table %>%
+  select(Model_Name, N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB, RR_BS) %>%
+  pivot_longer(cols = starts_with("RR_"),
+               names_to = "Method", values_to = "RejectionRate") %>%
+  mutate(Method = factor(Method,
+                         levels = c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan",
+                                    "RR_SB", "RR_YB", "RR_BS"),
+                         labels = c("Uncorrected LRT", "Swain (Bartlett)", "Bartlett (Gen)",
+                                    "Yuan-2015", "Satorra-Bentler", "Yuan-Bentler",
+                                    "Bollen-Stine")))
+
+ggplot(plot_data, aes(x = N, y = RejectionRate, color = Method, group = Method)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black", linewidth = 0.5) +
+  # Bradley's robustness bounds
+  geom_ribbon(aes(ymin = 4.5, ymax = 5.5, fill = "Robust Zone"),
+              alpha = 0.1, color = NA, show.legend = TRUE) +
+  scale_x_log10(breaks = sample_sizes) +
+  scale_fill_manual(values = "grey50", guide = guide_legend(override.aes = list(alpha = 0.3))) +
+  facet_wrap(~ Model_Name, scales = "free_y", ncol = 1) +
+  labs(title = "Type I Error Rates Across Model Complexity Levels",
+       subtitle = "Dashed line = nominal alpha (5%); shaded band = Bradley's robust zone (4.5%--5.5%)",
+       x = "Sample Size (Log Scale)",
+       y = "Rejection Rate (%)",
+       color = "Correction Method",
+       fill = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 12))
+```
+
+## 4.2 Focused Plot: Small Sample Sizes (N <= 500)
+
+```{r plot-small-n, fig.width=14, fig.height=10}
+plot_small <- plot_data %>%
+  filter(N <= 500)
+
+ggplot(plot_small, aes(x = N, y = RejectionRate, color = Method, group = Method)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black") +
+  geom_ribbon(aes(ymin = 4.5, ymax = 5.5), alpha = 0.1, fill = "grey50", color = NA) +
+  facet_wrap(~ Model_Name, scales = "free_y", ncol = 1) +
+  labs(title = "Type I Error Rates at Small Sample Sizes (N <= 500)",
+       subtitle = "Where small-sample corrections matter most",
+       x = "Sample Size",
+       y = "Rejection Rate (%)") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 12))
+```
+
+## 4.3 Method Comparison at Key Sample Sizes
+
+```{r plot-bar-comparison, fig.width=14, fig.height=10}
+key_ns <- c(50, 100, 200, 300, 500)
+
+bar_data <- summary_table %>%
+  filter(N %in% key_ns) %>%
+  select(Model_Name, N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB, RR_BS) %>%
+  pivot_longer(cols = starts_with("RR_"),
+               names_to = "Method", values_to = "RejectionRate") %>%
+  mutate(Method = factor(Method,
+                         levels = c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan",
+                                    "RR_SB", "RR_YB", "RR_BS"),
+                         labels = c("Uncorrected", "Swain", "Bartlett", "Yuan-2015",
+                                    "Satorra-Bentler", "Yuan-Bentler", "Bollen-Stine")),
+         N = factor(N))
+
+ggplot(bar_data, aes(x = Method, y = RejectionRate, fill = Method)) +
+  geom_col(alpha = 0.8) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "red", linewidth = 0.8) +
+  facet_grid(Model_Name ~ N) +
+  labs(title = "Rejection Rates at Key Sample Sizes",
+       subtitle = "Red dashed line = nominal alpha (5%)",
+       x = NULL, y = "Rejection Rate (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        legend.position = "none",
+        strip.text = element_text(face = "bold"))
+```
+
+# 5. Convergence Rate Analysis
+
+A key theoretical result from the Edgeworth expansion is that the Bartlett correction
+changes the **order of convergence** of the chi-square approximation:
+
+| Method | Theoretical Error Order | Convergence Type |
+|---|---|---|
+| Uncorrected LRT | $O(1/N)$ | Linear |
+| Bartlett / Swain | $O(1/N^2)$ | Quadratic |
+| Yuan (2015) | $O(1/N^3)$ | Cubic |
+| Bollen-Stine | $O(1/B)$, B = bootstrap draws | N/A |
+
+We estimate the **empirical convergence rate** separately for each model complexity level.
+
+## 5.1 Power-Law Fit (Primary Method)
+
+$$\ln|RR(N) - \alpha| = \ln(a) - \beta \cdot \ln(N)$$
+
+The slope $\hat{\beta}$ is the empirical convergence rate.
+
+```{r convergence-power-law}
+tolerance <- 0.3  # exclude points too close to alpha (unstable in log space)
+
+methods_cols  <- c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan", "RR_SB", "RR_YB")
+methods_names <- c("Uncorrected LRT", "Swain", "Bartlett", "Yuan-2015",
+                   "Satorra-Bentler", "Yuan-Bentler")
+theo_orders   <- c(1, 2, 2, 3, 1, 1)
+
+all_convergence <- list()
+
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  tbl <- summary_table %>% filter(Model_Name == info$name)
+
+  conv_res <- data.frame(
+    Method = methods_names,
+    Beta_hat = NA_real_,
+    CI_lower = NA_real_,
+    CI_upper = NA_real_,
+    R_squared = NA_real_,
+    N_points = integer(length(methods_cols)),
+    Theoretical_Order = theo_orders,
+    stringsAsFactors = FALSE
+  )
+
+  for (m in seq_along(methods_cols)) {
+    col_name <- methods_cols[m]
+
+    dev_data <- tbl %>%
+      select(N, !!sym(col_name)) %>%
+      mutate(deviation = abs(!!sym(col_name) - alpha * 100)) %>%
+      filter(deviation > tolerance)
+
+    n_points <- nrow(dev_data)
+    conv_res$N_points[m] <- n_points
+
+    if (n_points >= 3) {
+      log_model <- lm(log(deviation) ~ log(N), data = dev_data)
+      beta_hat  <- -coef(log_model)["log(N)"]
+      conf_int  <- confint(log_model, "log(N)", level = 0.95)
+      r_sq      <- summary(log_model)$r.squared
+
+      conv_res$Beta_hat[m]  <- as.numeric(beta_hat)
+      conv_res$CI_lower[m]  <- -as.numeric(conf_int[2])
+      conv_res$CI_upper[m]  <- -as.numeric(conf_int[1])
+      conv_res$R_squared[m] <- r_sq
+    }
+  }
+
+  all_convergence[[model_key]] <- conv_res
+
+  cat(sprintf("\n### %s (df = %d)\n\n", info$name, info$df))
+  print(kable(conv_res,
+        digits = 3,
+        caption = paste0("Empirical Convergence Rates for ", info$name,
+                         ". Beta near 1 = linear, 2 = quadratic, 3 = cubic."),
+        col.names = c("Method", "Beta hat", "95% CI Lower", "95% CI Upper",
+                      "R-squared", "N Points", "Theoretical Order")))
+}
+```
+
+## 5.2 Convergence Plot (Log-Log) by Model
+
+```{r plot-convergence, fig.width=14, fig.height=10}
+conv_plot_list <- list()
+
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  tbl <- summary_table %>% filter(Model_Name == info$name)
+
+  for (m in seq_along(methods_cols)) {
+    col_name <- methods_cols[m]
+    temp <- tbl %>%
+      select(N, !!sym(col_name)) %>%
+      mutate(
+        Model  = info$name,
+        Method = methods_names[m],
+        deviation = abs(!!sym(col_name) - alpha * 100)
+      ) %>%
+      filter(deviation > tolerance) %>%
+      select(Model, N, Method, deviation)
+    conv_plot_list[[length(conv_plot_list) + 1]] <- temp
+  }
+}
+
+conv_plot_data <- bind_rows(conv_plot_list)
+
+ggplot(conv_plot_data, aes(x = N, y = deviation, color = Method, group = Method)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", linewidth = 0.7) +
+  scale_x_log10() +
+  scale_y_log10() +
+  facet_wrap(~ Model, scales = "free", ncol = 1) +
+  labs(title = "Convergence Rate: Deviation from Nominal Alpha (Log-Log)",
+       subtitle = "Slope = empirical convergence rate. Steeper = faster convergence.",
+       x = "Sample Size N (log scale)",
+       y = paste0("|Rejection Rate - ", alpha * 100, "%| (log scale)")) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 11))
+```
+
+## 5.3 Tolerance Threshold: Minimum N* for Accuracy
+
+Find the smallest N* where $|RR(N^*) - \alpha| < \varepsilon$.
+
+```{r convergence-threshold}
+tolerance_levels <- c(0.25, 0.50, 1.00)
+
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  tbl <- summary_table %>% filter(Model_Name == info$name)
+
+  cat(sprintf("\n### %s (df = %d)\n\n", info$name, info$df))
+
+  for (tol in tolerance_levels) {
+    row_list <- list()
+    for (m in seq_along(methods_cols)) {
+      col_name <- methods_cols[m]
+
+      valid_Ns <- tbl %>%
+        select(N, !!sym(col_name)) %>%
+        mutate(deviation = abs(!!sym(col_name) - alpha * 100)) %>%
+        filter(deviation <= tol) %>%
+        arrange(N)
+
+      N_star <- if (nrow(valid_Ns) > 0) valid_Ns$N[1] else NA_integer_
+      dev_at <- if (!is.na(N_star)) {
+        tbl %>% filter(N == N_star) %>% pull(!!sym(col_name)) - alpha * 100
+      } else NA_real_
+
+      row_list[[m]] <- data.frame(Method = methods_names[m],
+                                   N_star = N_star,
+                                   Deviation_at_Nstar = dev_at)
+    }
+
+    cat(sprintf("\n#### Tolerance: epsilon = %.2f%%\n\n", tol))
+    print(kable(bind_rows(row_list), digits = 3,
+          col.names = c("Method", "Minimum N*", "Deviation at N* (%)")))
+  }
+}
+```
+
+## 5.4 Half-Decay Rate
+
+```{r convergence-half-decay}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  tbl <- summary_table %>% filter(Model_Name == info$name)
+
+  decay_table <- tbl %>%
+    select(N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB) %>%
+    mutate(across(starts_with("RR_"), ~ abs(. - alpha * 100))) %>%
+    rename_with(~ gsub("RR_", "Dev_", .)) %>%
+    mutate(across(starts_with("Dev_"), ~ . / lag(.), .names = "{.col}_ratio"))
+
+  cat(sprintf("\n### %s: Half-Decay Ratios\n\n", info$name))
+  print(kable(
+    decay_table %>%
+      select(N, Dev_Unc_ratio, Dev_Swain_ratio, Dev_Bart_ratio,
+             Dev_Yuan_ratio, Dev_SB_ratio, Dev_YB_ratio),
+    digits = 3,
+    caption = "Ratio |dev(N_{k+1})| / |dev(N_k)|. Values < 0.5 = more than halved.",
+    col.names = c("N", "Uncorrected", "Swain", "Bartlett", "Yuan-2015",
+                  "Satorra-Bentler", "Yuan-Bentler")
+  ))
+}
+```
+
+## 5.5 Convergence Rate Summary
+
+```{r convergence-summary}
+for (model_key in names(models)) {
+  info <- model_info[[model_key]]
+  conv_res <- all_convergence[[model_key]]
+
+  cat(sprintf("\n### %s (df = %d): Convergence Rate Summary\n\n", info$name, info$df))
+  cat("Method                      | Empirical Beta | Theoretical | Interpretation\n")
+  cat("----------------------------|----------------|-------------|-----------------\n")
+  for (m in seq_len(nrow(conv_res))) {
+    beta <- conv_res$Beta_hat[m]
+    theo <- conv_res$Theoretical_Order[m]
+    name <- conv_res$Method[m]
+
+    if (!is.na(beta)) {
+      if (beta < 1.5)      interp <- "Linear (1/N)"
+      else if (beta < 2.5) interp <- "Quadratic (1/N^2)"
+      else                 interp <- "Cubic (1/N^3) or higher"
+    } else {
+      interp <- "Could not estimate"
+    }
+
+    cat(sprintf("%-27s | %14.3f | %11d | %s\n",
+                name, ifelse(is.na(beta), NA, beta), theo, interp))
+  }
+}
+```
+
+# 6. Model Complexity Comparison
+
+This section directly addresses **Question 1**: How does model complexity affect the performance of small-sample corrections?
+
+## 6.1 Rejection Rate Heatmap
+
+```{r plot-heatmap, fig.width=14, fig.height=12}
+small_n_table <- summary_table %>%
+  filter(N <= 500) %>%
+  select(Model_Name, N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB, RR_BS) %>%
+  pivot_longer(cols = starts_with("RR_"),
+               names_to = "Method", values_to = "RR") %>%
+  mutate(
+    Method = factor(Method, levels = c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan",
+                                        "RR_SB", "RR_YB", "RR_BS"),
+                    labels = c("Uncorrected", "Swain", "Bartlett", "Yuan-2015",
+                               "Satorra-Bentler", "Yuan-Bentler", "Bollen-Stine")),
+    N = factor(N),
+    Model_Name = factor(Model_Name, levels = sapply(model_info, function(x) x$name)),
+    Deviation = RR - 5
+  )
+
+ggplot(small_n_table, aes(x = Method, y = N, fill = Deviation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.1f", RR)), size = 2.5) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = 0, limits = c(-5, 20),
+                       name = "Deviation\nfrom 5%") +
+  facet_wrap(~ Model_Name, ncol = 1) +
+  labs(title = "Rejection Rate Heatmap: Model Complexity x Method x Sample Size",
+       subtitle = "Values in cells = rejection rate (%). Red = too liberal, Blue = too conservative.",
+       x = "Correction Method", y = "Sample Size") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        strip.text = element_text(face = "bold", size = 12),
+        legend.position = "right")
+```
+
+## 6.2 Best Method at Each N (Bradley's Robust Zone)
+
+For each combination of Model and N, identify which method(s) fall within Bradley's (1978) robust zone (4.5%--5.5%).
+
+```{r bradley-classification}
+bradley_table <- summary_table %>%
+  select(Model_Name, N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB, RR_BS) %>%
+  pivot_longer(cols = starts_with("RR_"),
+               names_to = "Method", values_to = "RR") %>%
+  mutate(
+    Method = factor(Method, levels = c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan",
+                                        "RR_SB", "RR_YB", "RR_BS"),
+                    labels = c("Uncorrected", "Swain", "Bartlett", "Yuan-2015",
+                               "Satorra-Bentler", "Yuan-Bentler", "Bollen-Stine")),
+    Bradley_Class = case_when(
+      is.na(RR) ~ "NA",
+      RR >= 4.5 & RR <= 5.5 ~ "Robust",
+      RR < 4.5 ~ "Conservative",
+      RR > 5.5 ~ "Liberal"
+    )
+  )
+
+# For each model x N, count how many methods are robust
+robust_count <- bradley_table %>%
+  filter(!is.na(RR)) %>%
+  group_by(Model_Name, N) %>%
+  summarise(
+    Robust_Methods = sum(Bradley_Class == "Robust"),
+    Liberal_Methods = sum(Bradley_Class == "Liberal"),
+    Conservative_Methods = sum(Bradley_Class == "Conservative"),
+    Total_Methods = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Robust_Pct = Robust_Methods / Total_Methods * 100)
+
+kable(robust_count,
+      digits = 1,
+      caption = "Number of methods within Bradley's robust zone by Model and Sample Size.",
+      col.names = c("Model", "N", "Robust", "Liberal", "Conservative",
+                    "Total", "Robust %"))
+```
+
+## 6.3 Method Ranking by Mean Absolute Deviation (MAD)
+
+For each model, rank methods by their Mean Absolute Deviation from 5% across all sample sizes (lower is better).
+
+```{r method-ranking}
+mad_table <- summary_table %>%
+  select(Model_Name, N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB, RR_BS) %>%
+  pivot_longer(cols = starts_with("RR_"),
+               names_to = "Method", values_to = "RR") %>%
+  filter(!is.na(RR)) %>%
+  group_by(Model_Name, Method) %>%
+  summarise(
+    MAD_all      = mean(abs(RR - 5), na.rm = TRUE),
+    MAD_small_N  = mean(abs(RR - 5)[N <= 300], na.rm = TRUE),
+    MAD_N50      = mean(abs(RR - 5)[N == 50], na.rm = TRUE),
+    MAD_N100     = mean(abs(RR - 5)[N == 100], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Method = factor(Method,
+                         levels = c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan",
+                                    "RR_SB", "RR_YB", "RR_BS"),
+                         labels = c("Uncorrected", "Swain", "Bartlett", "Yuan-2015",
+                                    "Satorra-Bentler", "Yuan-Bentler", "Bollen-Stine"))) %>%
+  arrange(Model_Name, MAD_all)
+
+kable(mad_table, digits = 2,
+      caption = "Method ranking by Mean Absolute Deviation from 5%. Lower = better.",
+      col.names = c("Model", "Method", "MAD (all N)", "MAD (N<=300)",
+                    "MAD (N=50)", "MAD (N=100)"))
+```
+
+## 6.4 Interaction Plot: Method Performance Across Model Complexities
+
+This plot directly shows how each correction method's performance changes as model complexity increases.
+
+```{r plot-interaction, fig.width=12, fig.height=8}
+interaction_data <- summary_table %>%
+  filter(N %in% c(50, 100, 150, 200, 300)) %>%
+  select(Model_Name, N, RR_Unc, RR_Swain, RR_Bart, RR_Yuan, RR_SB, RR_YB, RR_BS) %>%
+  pivot_longer(cols = starts_with("RR_"),
+               names_to = "Method", values_to = "RR") %>%
+  mutate(
+    Method = factor(Method, levels = c("RR_Unc", "RR_Swain", "RR_Bart", "RR_Yuan",
+                                        "RR_SB", "RR_YB", "RR_BS"),
+                    labels = c("Uncorrected", "Swain", "Bartlett", "Yuan-2015",
+                               "Satorra-Bentler", "Yuan-Bentler", "Bollen-Stine")),
+    Model_DF = case_when(
+      Model_Name == model_info$simple_cfa$name  ~ model_info$simple_cfa$df,
+      Model_Name == model_info$complex_cfa$name ~ model_info$complex_cfa$df,
+      Model_Name == model_info$full_sem$name    ~ model_info$full_sem$df
+    )
+  )
+
+ggplot(interaction_data, aes(x = Model_DF, y = RR, color = Method, group = Method)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black") +
+  facet_wrap(~ N) +
+  labs(title = "Method Performance Across Model Complexities",
+       subtitle = "X-axis = model degrees of freedom (higher = more complex). Dashed line = 5%.",
+       x = "Model Degrees of Freedom",
+       y = "Rejection Rate (%)",
+       color = "Correction Method") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"))
+```
+
+# 7. Session Info
+
+```{r session-info, echo=TRUE}
+sessionInfo()
+```
+```
