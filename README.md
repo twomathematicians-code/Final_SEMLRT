@@ -4,7 +4,7 @@ A Monte Carlo simulation study comparing seven small-sample correction methods f
 
 ## Overview
 
-In structural equation modeling (SEM), the standard chi-square test statistic (T_ML) often inflates Type I error rates at small sample sizes. This simulation evaluates how well seven correction methods recover the nominal alpha level (5%) under the null hypothesis (correctly specified models).
+In structural equation modeling (SEM), the standard chi-square test statistic ($$T_{ML}$$) often inflates Type I error rates at small sample sizes. This simulation evaluates how well seven correction methods recover the nominal alpha level (5%) under the null hypothesis (correctly specified models).
 
 **Design:** 3 models x 7 correction methods x 12 sample sizes x 1,000 replications
 
@@ -26,7 +26,7 @@ In structural equation modeling (SEM), the standard chi-square test statistic (T
 
 | # | Method | Implementation | Theoretical Error Order |
 |---|---|---|---|
-| 1 | **Uncorrected LRT** (T_ML) | Base test statistic: (n-1) x F_ML | O(1/N) |
+| 1 | **Uncorrected LRT** ($$T_{ML}$$) | Base test statistic: (n-1) x $$F_{ML}$$ | O(1/N) |
 | 2 | **Swain (Bartlett)** | `semTools::chisqSmallN(method = "swain")` | O(1/N^2) |
 | 3 | **Bartlett (General)** | `semTools::chisqSmallN(method = "bartlett")` | O(1/N^2) |
 | 4 | **Yuan (2015)** | `semTools::chisqSmallN(method = "yuan.2015")` | O(1/N^3) |
@@ -44,10 +44,10 @@ All mathematical formulas used in the simulation are listed below. Variables are
 | *p* | Number of observed (manifest) variables |
 | *t* | Number of latent variables |
 | *df* | Model degrees of freedom |
-| *F*_ML | Minimum of the ML discrepancy function |
+| $$F_{ML}$$ | Minimum of the ML discrepancy function |
 | *S* | Sample covariance matrix (*p* x *p*) |
-| Σ̂ | Model-implied covariance matrix (*p* x *p*) |
-| α | Nominal significance level (0.05) |
+| $$\hat{\Sigma}$$| Model-implied covariance matrix (*p* x *p*) |
+| $$\alpha$$ | Nominal significance level (0.05) |
 | *B* | Number of bootstrap draws (B = 200 for Bollen-Stine) |
 
 ---
@@ -190,8 +190,8 @@ $$\bar{d} = \frac{\hat{c}}{1 + \frac{\hat{a} - 2\hat{c} + \hat{c}^2}{2 \cdot df 
 
 where:
 
-- ĉ = the Satorra-Bentler mean scaling factor (from above)
-- â = an additional variance adjustment term derived from sixth-order moments
+- $$\hat{c}$$ = the Satorra-Bentler mean scaling factor (from above)
+- $$\hat{a}$$ = an additional variance adjustment term derived from sixth-order moments
 
 The *p*-value uses a shifted chi-squared reference distribution:
 
@@ -308,7 +308,7 @@ Points with |RR - 5| ≤ 0.3% are excluded to avoid log-space instability near z
 
 The 95% confidence interval:
 
-$$CI_{95\%}(\hat{\beta}) = \hat{\beta} \pm 1.96 \cdot SE(\hat{\beta})$$
+$$CI(\hat{\beta}) = \hat{\beta} \pm 1.96 \cdot SE(\hat{\beta})$$
 
 **Interpretation of β̂:**
 
@@ -352,11 +352,11 @@ A value of γ_k < 0.5 means the deviation more than halved when moving from *n*_
 
 To ensure identical data generation across all correction method chunks, each iteration uses a deterministic seed:
 
-$$\text{seed}(i) = 20240000 + \text{model\_offset} + i$$
+$$\text{seed}(i) = 20240000 +\text{model}\_\text{offset} + i$$
 
 where:
 
-$$\text{model\_offset} = (\text{model\_rank} - 1) \times |\mathcal{N}| \times R$$
+$$\text{model}\_\text{offset} = (\text{model}\_\text{rank} - 1) \times |\mathcal{N}| \times R$$
 
 - *i* = global iteration index (1 to |*N*| × *R* per model)
 - model_rank = 1 (Simple CFA), 2 (Complex CFA), 3 (Full SEM)
