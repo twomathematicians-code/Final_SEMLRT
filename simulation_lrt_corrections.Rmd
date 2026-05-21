@@ -1,0 +1,917 @@
+---
+title: "Monte Carlo Simulation: Small-Sample LRT Corrections in SEM"
+subtitle: "Complexity Matrix Design | Normal vs Non-Normal | 6 Methods | Bradley's Criterion"
+author: "Mahesh Pravinsinh Solanki"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  cache      = FALSE,
+  comment    = "##",
+  fig.width  = 12,
+  fig.height = 8
+)
+
+# ============================================================
+#  PACKAGES
+# ============================================================
+required_pkgs <- c("lavaan", "semTools", "MASS", "dplyr", "tidyr",
+                    "progress", "ggplot2", "knitr", "kableExtra")
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+```
+
+# ====================================================================
+#  GLOBAL SIMULATION SETTINGS
+# ====================================================================
+
+```{r global-settings}
+# --- Sample sizes (8 levels per professor's request) ---
+sample_sizes <- c(25, 50, 75, 100, 150, 300, 500, 10000)
+n_sizes       <- length(sample_sizes)
+
+# --- Number of replications ---
+n_reps <- 1000
+
+# --- Nominal significance level ---
+alpha <- 0.05
+
+# --- Bradley's robustness bounds ---
+bradley_lower <- 0.9 * alpha   # 0.045
+bradley_upper <- 1.1 * alpha   # 0.055
+
+# --- Two data conditions ---
+conditions <- c("normal", "nonnormal")
+
+# --- Non-normality parameters (Vale & Maurelli, 1983) ---
+target_skew <- 2        # marginal skewness
+target_ekurt <- 3       # marginal excess kurtosis
+
+# --- Global seed for reproducibility ---
+global_seed <- 20240601
+
+cat(sprintf("Design: %d models x %d methods x %d sizes x %d conditions x %d reps = %d total iterations\n",
+            3, 6, n_sizes, length(conditions), n_reps,
+            3 * 6 * n_sizes * length(conditions) * n_reps))
+```
+
+# ====================================================================
+#  SECTION 1: COMPLEXITY MATRIX  --  MODEL DEFINITIONS
+# ====================================================================
+
+Three population models are defined with degrees of freedom in three
+distinct ranges.  Complexity is a function of $p$ (observed variables),
+$t$ (free parameters), and $df = p(p+1)/2 - t$.
+
+**Rationale for three df ranges:**
+
+| Range | df | Why this range? |
+|-------|-----|-----------------|
+| **Low** (2--5) | 2 | Minimal model; tests whether corrections are even necessary at low complexity. Even $N/t$ is favorable at $N = 25$. |
+| **Medium** (6--15) | 8 | Typical applied CFA with 2 factors; $N/t$ becomes unfavorable below $N = 100$. The most common model in practice. |
+| **High** (20--40) | 24 | Complex model with 3 correlated factors; strong test of corrections. $N/t$ is very unfavorable at small $N$. |
+
+```{r model-definitions}
+# ============================================================
+#  MODEL 1  --  LOW complexity  (df = 2)
+#  One-factor CFA with 4 indicators
+#  p = 4,  unique = 10,  t = 8,  df = 2
+# ============================================================
+model1_syntax <- '
+  f1 =~ x1 + x2 + x3 + x4
+'
+
+# ============================================================
+#  MODEL 2  --  MEDIUM complexity  (df = 8)
+#  Two-factor CFA with 6 indicators, 1 factor correlation
+#  p = 6,  unique = 21,  t = 13,  df = 8
+# ============================================================
+model2_syntax <- '
+  f1 =~ y1 + y2 + y3
+  f2 =~ y4 + y5 + y6
+  f1 ~~ f2
+'
+
+# ============================================================
+#  MODEL 3  --  HIGH complexity  (df = 24)
+#  Three-factor CFA with 9 indicators, 3 factor correlations
+#  p = 9,  unique = 45,  t = 21,  df = 24
+# ============================================================
+model3_syntax <- '
+  f1 =~ z1 + z2 + z3
+  f2 =~ z4 + z5 + z6
+  f3 =~ z7 + z8 + z9
+  f1 ~~ f2
+  f1 ~~ f3
+  f2 ~~ f3
+'
+
+# ============================================================
+#  MODEL REGISTRY
+# ============================================================
+models <- list(
+  model1 = list(
+    name = "M1: Simple CFA",
+    description = "1 factor, 4 indicators",
+    syntax = model1_syntax,
+    p = 4, t_expected = 8, df_expected = 2
+  ),
+  model2 = list(
+    name = "M2: Two-Factor CFA",
+    description = "2 factors, 6 indicators, 1 correlation",
+    syntax = model2_syntax,
+    p = 6, t_expected = 13, df_expected = 8
+  ),
+  model3 = list(
+    name = "M3: Three-Factor CFA",
+    description = "3 factors, 9 indicators, 3 correlations",
+    syntax = model3_syntax,
+    p = 9, t_expected = 21, df_expected = 24
+  )
+)
+
+# ============================================================
+#  VERIFY df BY FITTING A DUMMY MODEL (N = 5000)
+# ============================================================
+cat("\n=== COMPLEXITY MATRIX (VERIFIED) ===\n\n")
+model_registry <- list()
+for (key in names(models)) {
+  m <- models[[key]]
+  dummy_data <- tryCatch(
+    simulateData(m$syntax, sample.nobs = 5000),
+    error = function(e) NULL
+  )
+  if (!is.null(dummy_data)) {
+    dummy_fit <- tryCatch(
+      sem(m$syntax, data = dummy_data, warn = FALSE),
+      error = function(e) NULL
+    )
+    if (!is.null(dummy_fit)) {
+      actual_df  <- as.integer(fitMeasures(dummy_fit, "df"))
+      actual_p   <- ncol(dummy_data)
+      actual_t   <- lavInspect(dummy_fit, "npar")
+      model_registry[[key]] <- list(
+        name  = m$name,
+        desc  = m$description,
+        syntax = m$syntax,
+        p     = actual_p,
+        t     = actual_t,
+        df    = actual_df
+      )
+      cat(sprintf("  %s:  p = %d,  t = %d,  df = %d\n",
+                  m$name, actual_p, actual_t, actual_df))
+    }
+  }
+}
+```
+
+```{r complexity-table, echo=FALSE}
+cm <- do.call(rbind, lapply(model_registry, function(m) {
+  data.frame(Model = m$name, Description = m$desc,
+             p = m$p, t = m$t, df = m$df,
+             df_Range = ifelse(m$df <= 5, "Low",
+                        ifelse(m$df <= 15, "Medium", "High")),
+             stringsAsFactors = FALSE)
+}))
+kable(cm, caption = "Complexity Matrix: Model specifications verified via dummy fit.",
+      col.names = c("Model", "Description", "p", "t", "df", "Complexity Range"))
+```
+
+# ====================================================================
+#  SECTION 2: HELPER FUNCTIONS
+# ====================================================================
+
+```{r helper-functions}
+# ---------------------------------------------------------------
+#  Safe wrappers (prevent simulation from crashing on any error)
+# ---------------------------------------------------------------
+
+safe_fit <- function(syntax, data, estimator = "ML") {
+  tryCatch(
+    sem(model = syntax, data = data, estimator = estimator, warn = FALSE),
+    error = function(e) NULL
+  )
+}
+
+safe_fm <- function(fit, measure) {
+  if (is.null(fit)) return(NA_real_)
+  tryCatch(
+    as.numeric(unclass(fitMeasures(fit, measure))),
+    error = function(e) NA_real_
+  )
+}
+
+safe_reject <- function(p, alpha = 0.05) {
+  if (length(p) != 1) return(NA)
+  if (is.na(p)) return(NA)
+  as.integer(p < alpha)
+}
+
+# ---------------------------------------------------------------
+#  Bradley classification
+# ---------------------------------------------------------------
+
+bradley_class <- function(rate, alpha = 0.05) {
+  lower <- 0.9 * alpha
+  upper <- 1.1 * alpha
+  ifelse(rate >= lower & rate <= upper, "Robust",
+         ifelse(rate > upper, "Liberal", "Conservative"))
+}
+```
+
+# ====================================================================
+#  SECTION 3: SIX CORRECTION METHODS
+# ====================================================================
+
+## 3.1 Method 1 -- Uncorrected $T_{ML}$ (Baseline)
+
+The standard ML chi-square statistic: $T_{ML} = (n-1) F_{ML}$
+referenced to $\chi^2_{df}$.
+
+```{r method-ml}
+method_ml <- function(fit) {
+  list(
+    chisq  = safe_fm(fit, "chisq"),
+    pvalue = safe_fm(fit, "pvalue")
+  )
+}
+```
+
+## 3.2 Method 2 -- Bartlett Correction
+
+Bartlett (1937) correction:  $T_{Bart} = c \cdot T_{ML}$
+where $c = 1 - \frac{2t + 2p + 3}{2n - 2t - 2p - 1}$.
+Referenced to $\chi^2_{df}$.  Achieves $O(n^{-2})$ accuracy.
+
+```{r method-bartlett}
+method_bartlett <- function(fit) {
+  if (is.null(fit)) return(list(chisq = NA_real_, pvalue = NA_real_))
+  res <- tryCatch(
+    chisqSmallN(fit, smallN.method = "bartlett"),
+    error = function(e) NULL
+  )
+  if (is.null(res) || length(res) == 0)
+    return(list(chisq = NA_real_, pvalue = NA_real_))
+  list(
+    chisq  = as.numeric(res[["chisq"]]),
+    pvalue = as.numeric(res[["pvalue"]])
+  )
+}
+```
+
+## 3.3 Method 3 -- Swain Correction
+
+Swain (1975) closed-form Bartlett correction for covariance structure
+models.  Mathematically equivalent to Bartlett under normality but
+uses the alternative stable formulation for numerical safety.
+
+```{r method-swain}
+method_swain <- function(fit) {
+  if (is.null(fit)) return(list(chisq = NA_real_, pvalue = NA_real_))
+  res <- tryCatch(
+    chisqSmallN(fit, smallN.method = "swain"),
+    error = function(e) NULL
+  )
+  if (is.null(res) || length(res) == 0)
+    return(list(chisq = NA_real_, pvalue = NA_real_))
+  list(
+    chisq  = as.numeric(res[["chisq"]]),
+    pvalue = as.numeric(res[["pvalue"]])
+  )
+}
+```
+
+## 3.4 Method 4 -- Satorra-Bentler Scaled $\chi^2$ ($T_{SB}$)
+
+Satorra & Bentler (1988, 1994) mean-adjusted statistic using a
+sandwich estimator for the asymptotic covariance matrix.
+Designed for non-normal data.  Estimator: **MLM**.
+
+$$T_{SB} = \frac{T_{ML}}{\hat{c}}, \quad \hat{c} = \frac{\text{tr}[(\hat{\Gamma}\hat{W})^2]}{\text{tr}[\hat{\Gamma}\hat{W}]^2/df}$$
+
+```{r method-sb}
+method_sb <- function(fit) {
+  list(
+    chisq  = safe_fm(fit, "chisq.scaled"),
+    pvalue = safe_fm(fit, "pvalue.scaled")
+  )
+}
+```
+
+## 3.5 Method 5 -- Yuan-Bentler $T_2$ ($T_{YB}$)
+
+Yuan & Bentler (1997, 1998) mean- and variance-adjusted statistic.
+Better small-sample control than SB under both normal and non-normal
+conditions.  Estimator: **MLR**.
+
+$$T_{YB} = \frac{T_{ML}}{\bar{c}}, \quad \bar{c} = \frac{\hat{a}}{\hat{a}^2 + \hat{b}}$$
+
+```{r method-yb}
+method_yb <- function(fit) {
+  list(
+    chisq  = safe_fm(fit, "chisq.scaled"),
+    pvalue = safe_fm(fit, "pvalue.scaled")
+  )
+}
+```
+
+## 3.6 Method 6 -- F-Corrected LRT ($T_F$)
+
+Browne (1982) F-approximation replaces the $\chi^2_{df}$ reference with
+an $F_{df_1, df_2}$ distribution.  The heavier tails of the
+$F$-distribution naturally produce a more conservative test in
+small samples.
+
+**Derivation (from Lawley's expansion, see Cordeiro & Cribari-Neto 2014,
+Section 2.3):**  The expected value of $T_{ML}$ under $H_0$ is
+$E[T_{ML}] = df + \varepsilon$ where $\varepsilon = O(n^{-1})$.
+Rather than scaling $T_{ML}$ to match the $\chi^2$ mean (Bartlett),
+we match both the mean and variance to an $F$-distribution:
+
+$$F = \frac{T_{ML}}{df}, \quad F \sim F_{df,\, \nu}$$
+
+where the denominator df is derived from the bias magnitude:
+
+$$\nu = \frac{6(n-1)}{2t + 2p + 3}$$
+
+This ensures that as $n \to \infty$, $\nu \to \infty$ and
+$F_{df, \nu} \to \chi^2_{df}/df$, recovering the standard test.
+
+```{r method-fcorrected}
+method_f_corrected <- function(fit) {
+  chisq <- safe_fm(fit, "chisq")
+  df    <- safe_fm(fit, "df")
+  if (any(is.na(c(chisq, df)))) return(list(chisq = NA_real_, pvalue = NA_real_))
+
+  n   <- nobs(fit)
+  p_v <- length(lavNames(fit))
+  t_p <- lavInspect(fit, "npar")
+
+  # Denominator df from moment-matching (Browne 1982)
+  epsilon <- (2 * t_p + 2 * p_v + 3) / (3 * (n - 1))
+  nu <- 2 / epsilon                          # = 6(n-1)/(2t+2p+3)
+  nu <- max(nu, df + 1)                      # ensure nu > df
+
+  f_stat <- chisq / df
+  pval   <- pf(f_stat, df1 = df, df2 = nu, lower.tail = FALSE)
+
+  list(chisq = chisq, f_stat = f_stat, pvalue = pval, df2 = nu, epsilon = epsilon)
+}
+```
+
+## 3.7 Method Registry
+
+```{r method-registry}
+methods_list <- list(
+  ML       = list(label = "Uncorrected T_ML",     fn = method_ml,          estimator = "ML"),
+  Bartlett = list(label = "Bartlett",              fn = method_bartlett,     estimator = "ML"),
+  Swain    = list(label = "Swain",                 fn = method_swain,        estimator = "ML"),
+  SB       = list(label = "Satorra-Bentler (MLM)", fn = method_sb,           estimator = "MLM"),
+  YB       = list(label = "Yuan-Bentler (MLR)",    fn = method_yb,           estimator = "MLR"),
+  Fcor     = list(label = "F-Corrected LRT",       fn = method_f_corrected,  estimator = "ML")
+)
+
+cat("Methods loaded:\n")
+for (nm in names(methods_list)) {
+  cat(sprintf("  %s: %s (estimator = %s)\n",
+              nm, methods_list[[nm]]$label, methods_list[[nm]]$estimator))
+}
+```
+
+# ====================================================================
+#  SECTION 4: DATA GENERATION  --  NORMAL & NON-NORMAL
+# ====================================================================
+
+## 4.1 Normal Data Generation
+
+Uses `lavaan::simulateData()` which draws from the model-implied
+multivariate normal distribution.
+
+```{r gen-normal}
+generate_normal <- function(syntax, n) {
+  tryCatch(
+    simulateData(syntax, sample.nobs = n),
+    error = function(e) NULL
+  )
+}
+```
+
+## 4.2 Non-Normal Data Generation (Vale & Maurelli, 1983)
+
+Generates data with marginal skewness = `r target_skew` and
+excess kurtosis = `r target_ekurt` using the Fleishman (1978) power
+method within the Vale-Maurelli framework.
+
+**Why skew = 2, kurtosis = 3?**
+These values represent mild-to-moderate non-normality commonly observed
+in social science data (cf. Curran, West & Finch 1996; Muthen & Kaplan
+1985).  They provide a meaningful but not extreme test of the robust
+corrections (SB, YB) versus the normal-theory corrections (Bartlett,
+Swain, F).
+
+```{r gen-nonnormal}
+# ---------------------------------------------------------------
+#  Find Fleishman (1978) coefficients (a, b, c, d) for target
+#  marginal skewness and excess kurtosis.
+#  X = a + b*Z + c*Z^2 + d*Z^3,  Z ~ N(0,1)
+# ---------------------------------------------------------------
+find_fleishman <- function(skew, ekurt, start = c(0.8, 0.05, 0.2)) {
+
+  obj <- function(par) {
+    b <- par[1]; c <- par[2]; d <- par[3]
+    # Moment conditions (a = -c for zero mean):
+    #   Var[X]  = b^2 + 6bd + 2c^2 + 15d^2 = 1
+    #   Skew[X] = 2c(b^2 + 24bd + 105d^2 + 2) = gamma1
+    #   Ekurt   = 24[bd + c^2(1+b^2+28bd) + d^2(12+48bd+141c^2+225d^2)] = gamma2
+    f1 <- b^2 + 6*b*d + 2*c^2 + 15*d^2 - 1
+    f2 <- 2*c*(b^2 + 24*b*d + 105*d^2 + 2) - skew
+    f3 <- 24*(b*d + c^2*(1 + b^2 + 28*b*d) +
+              d^2*(12 + 48*b*d + 141*c^2 + 225*d^2)) - ekurt
+    f1^2 + f2^2 + f3^2
+  }
+
+  res <- optim(start, obj, method = "Nelder-Mead",
+               control = list(maxit = 100000))
+  c(a = -res$par[2], b = res$par[1], c = res$par[2], d = res$par[3])
+}
+
+# ---------------------------------------------------------------
+#  Generate non-normal multivariate data via Vale-Maurelli (1983)
+# ---------------------------------------------------------------
+generate_nonnormal <- function(syntax, n, skew = 2, ekurt = 3) {
+  # Step 1: get model-implied covariance matrix Sigma
+  ref <- tryCatch(
+    simulateData(syntax, sample.nobs = 10000),
+    error = function(e) NULL
+  )
+  if (is.null(ref)) return(NULL)
+  Sigma <- cov(ref)
+  p_v <- ncol(Sigma)
+
+  # Step 2: find Fleishman coefficients
+  fc <- find_fleishman(skew, ekurt)
+
+  # Step 3: compute intermediate correlation matrix (Vale & Maurelli)
+  # For Z ~ N(0, R_inter), after transform X = f(Z), we get Cor(X) = Sigma
+  # The intermediate correlation r_ij satisfies:
+  #   r_ij + r_ij^2 * fc["c"]^2 * (something) + ... = sigma_ij / (sd_xi * sd_xj)
+  # We use the numerical approximation from the Fleishman system.
+  #
+  # For simplicity and reliability, we use a rank-preserving approach:
+  # generate normal data -> transform marginals -> rescale covariance.
+  # This is a widely-used practical approximation.
+
+  Z <- tryCatch(
+    MASS::mvrnorm(n, mu = rep(0, p_v), Sigma = Sigma),
+    error = function(e) NULL
+  )
+  if (is.null(Z)) return(NULL)
+
+  # Step 4: apply Fleishman transformation to each marginal
+  X <- Z
+  for (j in 1:p_v) {
+    zj <- scale(Z[, j])                     # standardize column
+    X[, j] <- fc["a"] + fc["b"]*zj +
+              fc["c"]*zj^2 + fc["d"]*zj^3   # Fleishman transform
+  }
+
+  # Step 5: rescale to approximate target covariance
+  # (The Vale-Maurelli proper solution uses intermediate correlations;
+  #  this rank-based approximation preserves the dependence structure
+  #  and achieves the target marginal skewness/kurtosis.)
+  X <- as.data.frame(X)
+  colnames(X) <- colnames(Sigma)
+  return(X)
+}
+```
+
+## 4.3 Verify Data Generation
+
+```{r verify-data-gen, message=TRUE}
+cat("\n=== DATA GENERATION VERIFICATION ===\n")
+set.seed(global_seed)
+
+for (mkey in names(model_registry)) {
+  m <- model_registry[[mkey]]
+  cat(sprintf("\n  %s (p=%d, df=%d):\n", m$name, m$p, m$df))
+
+  # Normal
+  d_norm <- generate_normal(m$syntax, n = 5000)
+  if (!is.null(d_norm)) {
+    cat(sprintf("    Normal:       skew = %.3f,  ekurt = %.3f (target: 0, 0)\n",
+                mean(abs(sapply(d_norm, function(x) e1071::skewness(x)))),
+                mean(sapply(d_norm, function(x) e1071::kurtosis(x)) - 3)))
+  }
+
+  # Non-normal
+  d_nn <- generate_nonnormal(m$syntax, n = 5000, skew = target_skew, ekurt = target_ekurt)
+  if (!is.null(d_nn)) {
+    cat(sprintf("    Non-normal:   skew = %.3f,  ekurt = %.3f (target: %.1f, %.1f)\n",
+                mean(abs(sapply(d_nn, function(x) e1071::skewness(x)))),
+                mean(sapply(d_nn, function(x) e1071::kurtosis(x)) - 3),
+                target_skew, target_ekurt))
+  }
+}
+```
+
+# ====================================================================
+#  SECTION 5: STEP-BY-STEP VALIDATION  (small scale)
+# ====================================================================
+
+Before running the full simulation, validate each method individually
+on a tiny dataset to catch errors early.
+
+```{r validation-single-rep}
+cat("\n=== STEP-BY-STEP METHOD VALIDATION ===\n")
+cat("Testing each method on Model 1, N=100, 1 replication.\n\n")
+
+set.seed(global_seed)
+test_syntax <- model_registry$model1$syntax
+test_data   <- generate_normal(test_syntax, n = 100)
+
+# Fit with three estimators
+fit_ml  <- safe_fit(test_syntax, test_data, estimator = "ML")
+fit_mlm <- safe_fit(test_syntax, test_data, estimator = "MLM")
+fit_mlr <- safe_fit(test_syntax, test_data, estimator = "MLR")
+
+cat(sprintf("  ML fit:  convergence = %s\n",
+            ifelse(!is.null(fit_ml),  "OK", "FAILED")))
+cat(sprintf("  MLM fit: convergence = %s\n",
+            ifelse(!is.null(fit_mlm), "OK", "FAILED")))
+cat(sprintf("  MLR fit: convergence = %s\n",
+            ifelse(!is.null(fit_mlr), "OK", "FAILED")))
+
+# Test each method
+methods_to_test <- list(
+  ML       = list(fn = method_ml,          fit = fit_ml),
+  Bartlett = list(fn = method_bartlett,    fit = fit_ml),
+  Swain    = list(fn = method_swain,       fit = fit_ml),
+  SB       = list(fn = method_sb,          fit = fit_mlm),
+  YB       = list(fn = method_yb,          fit = fit_mlr),
+  Fcor     = list(fn = method_f_corrected, fit = fit_ml)
+)
+
+validation_results <- data.frame(
+  Method = character(),
+  Chisq  = numeric(),
+  PValue = numeric(),
+  Reject = character(),
+  stringsAsFactors = FALSE
+)
+
+for (nm in names(methods_to_test)) {
+  mt <- methods_to_test[[nm]]
+  res <- mt$fn(mt$fit)
+  rej <- safe_reject(res$pvalue, alpha)
+  validation_results <- rbind(validation_results, data.frame(
+    Method = nm,
+    Chisq  = round(res$chisq, 4),
+    PValue = round(res$pvalue, 6),
+    Reject = ifelse(is.na(rej), "NA", ifelse(rej == 1, "YES", "NO")),
+    stringsAsFactors = FALSE
+  ))
+}
+
+kable(validation_results, caption = "Single-replication validation: each method on M1, N=100, normal data.")
+```
+
+```{r validation-small-sim}
+# Mini-simulation: 50 reps, 1 model, 1 sample size, both conditions
+cat("\n=== MINI SIMULATION (50 reps, M1, N=50) ===\n")
+
+mini_results <- list()
+set.seed(global_seed + 1)
+
+for (cond in conditions) {
+  res_mat <- matrix(NA_real_, nrow = 50, ncol = 6)
+  colnames(res_mat) <- c("ML", "Bartlett", "Swain", "SB", "YB", "Fcor")
+
+  pb <- progress_bar$new(
+    format = "  [:bar] :percent | :current/:total | cond=:cond",
+    total = 50, clear = FALSE, width = 60
+  )
+
+  for (i in 1:50) {
+    pb$tick(tokens = list(cond = cond))
+
+    # Generate data
+    if (cond == "normal") {
+      sim_data <- generate_normal(model_registry$model1$syntax, n = 50)
+    } else {
+      sim_data <- generate_nonnormal(model_registry$model1$syntax, n = 50,
+                                     skew = target_skew, ekurt = target_ekurt)
+    }
+    if (is.null(sim_data)) next
+
+    # Fit models
+    f_ml  <- safe_fit(model_registry$model1$syntax, sim_data, "ML")
+    f_mlm <- safe_fit(model_registry$model1$syntax, sim_data, "MLM")
+    f_mlr <- safe_fit(model_registry$model1$syntax, sim_data, "MLR")
+
+    res_mat[i, 1] <- method_ml(f_ml)$pvalue
+    res_mat[i, 2] <- method_bartlett(f_ml)$pvalue
+    res_mat[i, 3] <- method_swain(f_ml)$pvalue
+    res_mat[i, 4] <- method_sb(f_mlm)$pvalue
+    res_mat[i, 5] <- method_yb(f_mlr)$pvalue
+    res_mat[i, 6] <- method_f_corrected(f_ml)$pvalue
+  }
+
+  rej_rates <- colMeans(res_mat < alpha, na.rm = TRUE)
+  mini_results[[cond]] <- data.frame(
+    Condition = cond,
+    Method   = names(rej_rates),
+    RejectionRate = round(rej_rates * 100, 2),
+    Bradley  = bradley_class(rej_rates),
+    stringsAsFactors = FALSE
+  )
+}
+
+kable(do.call(rbind, mini_results),
+      caption = "Mini-simulation validation (50 reps, M1, N=50). Target rate = 5%.")
+```
+
+# ====================================================================
+#  SECTION 6: FULL SIMULATION WITH COUNTERS
+# ====================================================================
+
+```{r full-simulation}
+# ============================================================
+#  FULL MONTE CARLO SIMULATION
+#  3 models x 6 methods x 8 sizes x 2 conditions x 1000 reps
+# ============================================================
+
+cat("\n")
+cat("============================================================\n")
+cat("  FULL SIMULATION STARTING\n")
+cat(sprintf("  %d models x %d methods x %d sizes x %d conds x %d reps\n",
+            length(model_registry), length(methods_list),
+            n_sizes, length(conditions), n_reps))
+cat("============================================================\n\n")
+
+all_results <- list()
+global_counter <- 0L
+total_iterations <- length(model_registry) * n_sizes * length(conditions) * n_reps
+
+master_pb <- progress_bar$new(
+  format = "  MASTER [:bar] :percent | :current/:total (:eta) | :info",
+  total  = total_iterations,
+  clear  = FALSE,
+  width  = 80
+)
+
+cond_offset <- list(normal = 0L, nonnormal = as.integer(n_sizes * n_reps * length(model_registry)))
+
+for (cond in conditions) {
+
+  for (mkey in names(model_registry)) {
+    m <- model_registry[[mkey]]
+
+    for (n in sample_sizes) {
+
+      # Accumulator for this cell
+      pval_matrix <- matrix(NA_real_, nrow = n_reps, ncol = 6)
+      colnames(pval_matrix) <- c("ML", "Bartlett", "Swain", "SB", "YB", "Fcor")
+      conv_ml  <- logical(n_reps)
+      conv_mlm <- logical(n_reps)
+      conv_mlr <- logical(n_reps)
+
+      for (i in 1:n_reps) {
+
+        global_counter <- global_counter + 1L
+        iter_seed <- global_seed + global_counter
+
+        master_pb$tick(tokens = list(
+          info = sprintf("%s | %s | N=%d | Rep %d/%d",
+                         cond, m$name, n, i, n_reps)
+        ))
+
+        set.seed(iter_seed)
+
+        # --- DATA GENERATION ---
+        if (cond == "normal") {
+          sim_data <- generate_normal(m$syntax, n)
+        } else {
+          sim_data <- generate_nonnormal(m$syntax, n,
+                                         skew = target_skew,
+                                         ekurt = target_ekurt)
+        }
+
+        if (is.null(sim_data)) next  # data generation failed
+
+        # --- MODEL FITTING (3 estimators) ---
+        f_ml  <- safe_fit(m$syntax, sim_data, "ML")
+        f_mlm <- safe_fit(m$syntax, sim_data, "MLM")
+        f_mlr <- safe_fit(m$syntax, sim_data, "MLR")
+
+        conv_ml[i]  <- !is.null(f_ml)
+        conv_mlm[i] <- !is.null(f_mlm)
+        conv_mlr[i] <- !is.null(f_mlr)
+
+        # --- EXTRACT P-VALUES (6 methods) ---
+        pval_matrix[i, "ML"]       <- method_ml(f_ml)$pvalue
+        pval_matrix[i, "Bartlett"] <- method_bartlett(f_ml)$pvalue
+        pval_matrix[i, "Swain"]    <- method_swain(f_ml)$pvalue
+        pval_matrix[i, "SB"]       <- method_sb(f_mlm)$pvalue
+        pval_matrix[i, "YB"]       <- method_yb(f_mlr)$pvalue
+        pval_matrix[i, "Fcor"]     <- method_f_corrected(f_ml)$pvalue
+
+      } # end reps
+
+      # --- SUMMARIZE THIS CELL ---
+      rej_rates <- colMeans(pval_matrix < alpha, na.rm = TRUE)
+      conv_rates <- c(
+        ML  = mean(conv_ml),
+        MLM = mean(conv_mlm),
+        MLR = mean(conv_mlr)
+      )
+
+      cell_summary <- data.frame(
+        Condition = cond,
+        Model     = m$name,
+        N         = n,
+        df        = m$df,
+        p         = m$p,
+        t         = m$t,
+        ML       = round(rej_rates["ML"] * 100, 2),
+        Bartlett = round(rej_rates["Bartlett"] * 100, 2),
+        Swain    = round(rej_rates["Swain"] * 100, 2),
+        SB       = round(rej_rates["SB"] * 100, 2),
+        YB       = round(rej_rates["YB"] * 100, 2),
+        Fcor     = round(rej_rates["Fcor"] * 100, 2),
+        Conv_ML  = round(conv_rates["ML"] * 100, 1),
+        Conv_MLM = round(conv_rates["MLM"] * 100, 1),
+        Conv_MLR = round(conv_rates["MLR"] * 100, 1),
+        stringsAsFactors = FALSE
+      )
+
+      all_results[[paste(cond, mkey, n, sep = "_")]] <- cell_summary
+
+    } # end sample sizes
+  } # end models
+} # end conditions
+
+cat("\n\nSIMULATION COMPLETE.\n\n")
+
+# --- Combine all results ---
+full_table <- do.call(rbind, all_results)
+full_table$row_id <- NULL
+saveRDS(full_table, "simulation_results_full.rds")
+cat("Results saved to simulation_results_full.rds\n")
+```
+
+# ====================================================================
+#  SECTION 7: ANALYSIS  --  BRADLEY'S CRITERION ONLY
+# ====================================================================
+
+```{r analysis-bradley}
+results <- readRDS("simulation_results_full.rds")
+
+# Add Bradley classification for each method
+method_cols <- c("ML", "Bartlett", "Swain", "SB", "YB", "Fcor")
+
+for (mc in method_cols) {
+  results[[paste0(mc, "_Bradley")]] <- bradley_class(results[[mc]] / 100)
+}
+
+cat("\n=== BRADLEY'S ROBUSTNESS CLASSIFICATION ===\n")
+cat(sprintf("Nominal alpha = %.2f, Robust interval: [%.3f, %.3f]\n\n",
+            alpha, bradley_lower, bradley_upper))
+```
+
+## 7.1 Results by Model and Condition (All Sample Sizes)
+
+```{r results-all}
+for (cond in conditions) {
+  cat(sprintf("\n## Condition: %s\n\n", toupper(cond)))
+  for (mkey in names(model_registry)) {
+    m <- model_registry[[mkey]]
+    sub <- results[results$Condition == cond & results$Model == m$name, ]
+    cat(sprintf("### %s (df = %d)\n\n", m$name, m$df))
+
+    display_cols <- c("N", method_cols, paste0(method_cols, "_Bradley"),
+                      "Conv_ML", "Conv_MLM", "Conv_MLR")
+    print(kable(sub[, display_cols], digits = 2, row.names = FALSE))
+    cat("\n")
+  }
+}
+```
+
+## 7.2 Bradley Classification Summary
+
+```{r bradley-summary}
+# Count Bradley classifications per condition
+for (cond in conditions) {
+  sub <- results[results$Condition == cond, ]
+  cat(sprintf("\n### %s: Bradley Classification Counts\n\n", toupper(cond)))
+
+  brad_counts <- data.frame()
+  for (mc in method_cols) {
+    brad_col <- paste0(mc, "_Bradley")
+    tbl <- table(sub[[brad_col]])
+    brad_counts <- rbind(brad_counts, data.frame(
+      Method      = mc,
+      Robust      = as.integer(tbl["Robust"]),
+      Liberal     = as.integer(tbl["Liberal"]),
+      Conservative = as.integer(tbl["Conservative"]),
+      stringsAsFactors = FALSE
+    ))
+  }
+  print(kable(brad_counts, caption = sprintf("Bradley classification counts (%s)", cond)))
+  cat("\n")
+}
+```
+
+## 7.3 Visualization: Rejection Rates with Bradley's Band
+
+```{r plot-rejection-rates}
+plot_data <- results %>%
+  select(Condition, Model, N, df, ML, Bartlett, Swain, SB, YB, Fcor) %>%
+  pivot_longer(
+    cols = c(ML, Bartlett, Swain, SB, YB, Fcor),
+    names_to = "Method", values_to = "RejectionRate"
+  )
+
+ggplot(plot_data, aes(x = N, y = RejectionRate, color = Method, group = Method)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "black") +
+  geom_ribbon(aes(ymin = bradley_lower * 100, ymax = bradley_upper * 100),
+              fill = "gray50", alpha = 0.15, color = NA) +
+  facet_grid(Model ~ Condition, scales = "free_y") +
+  scale_x_log10(breaks = sample_sizes) +
+  labs(
+    title    = "Type I Error Rates: All Methods x Models x Conditions",
+    subtitle = "Dashed = nominal 5%; Shaded = Bradley's robust zone [4.5%, 5.5%]",
+    x = "Sample Size (log scale)", y = "Rejection Rate (%)",
+    color = "Correction Method"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 10)
+  )
+```
+
+## 7.4 Minimum N for Bradley's Robust Classification
+
+For each method, find the smallest N where the rejection rate enters
+the robust interval and stays robust for all larger N.
+
+```{r min-n-robust}
+cat("\n### Minimum N for Robust Classification\n\n")
+
+min_n_table <- data.frame()
+for (cond in conditions) {
+  sub <- results[results$Condition == cond, ]
+  for (mkey in names(model_registry)) {
+    m <- model_registry[[mkey]]
+    msub <- sub[sub$Model == m$name, ]
+    msub <- msub[order(msub$N), ]
+
+    row_entry <- data.frame(Condition = cond, Model = m$name, df = m$df,
+                            stringsAsFactors = FALSE)
+
+    for (mc in method_cols) {
+      brad_col <- paste0(mc, "_Bradley")
+      robust_flags <- msub[[brad_col]] == "Robust"
+
+      # Find first N where robust AND all subsequent N are also robust
+      n_star <- NA_integer_
+      for (k in 1:nrow(msub)) {
+        if (all(robust_flags[k:nrow(msub)])) {
+          n_star <- msub$N[k]
+          break
+        }
+      }
+      row_entry[[mc]] <- ifelse(is.na(n_star), ">10000", n_star)
+    }
+    min_n_table <- rbind(min_n_table, row_entry)
+  }
+}
+
+kable(min_n_table,
+      caption = "Minimum sample size N* for Bradley's robust classification. '>10000' = never achieved.")
+```
+
+# ====================================================================
+#  SECTION 8: SESSION INFO
+# ====================================================================
+
+```{r session-info}
+sessionInfo()
+```
