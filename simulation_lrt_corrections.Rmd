@@ -46,7 +46,7 @@ sample_sizes <- c(25, 50, 75, 100, 150, 300, 500, 10000)
 n_sizes       <- length(sample_sizes)
 
 # --- Number of replications ---
-n_reps <- 1000
+n_reps <- 100
 
 # --- Nominal significance level ---
 alpha <- 0.05
